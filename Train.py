@@ -1,66 +1,86 @@
 import tensorflow as tf
-import tensorflow.keras as kr
+from tensorflow import keras as kr
 import HyperParameters as hp
-import Dataset
 
 
 @tf.function
-def _train_step(generator: kr.Model, discriminator: kr.Model, data: tf.Tensor, var_vectors, svm_weights):
+def _gan_train_step(discriminator: kr.Model, generator: kr.Model, latent_var_trace: tf.Variable, svm_weights, data):
     with tf.GradientTape(persistent=True) as tape:
-        real_images = Dataset.resize_and_normalize(data['image'])
+        real_images = data['image']
         batch_size = real_images.shape[0]
+        latent_vector_dim = tf.cast(hp.latent_vector_dim, 'float32')
+        latent_scale_vector = tf.sqrt(latent_vector_dim * latent_var_trace / tf.reduce_sum(latent_var_trace))
+        latent_vectors = hp.latent_dist_func(batch_size)
 
-        real_condition_vectors = tf.cast(tf.stack([data['attributes'][attribute] for attribute in hp.attributes], axis=-1), dtype='float32')
+        fake_images = generator(latent_vectors * latent_scale_vector[tf.newaxis])
+
+        real_condition_vectors = data['attributes']
         real_condition_vectors = tf.concat([real_condition_vectors, 1 - real_condition_vectors], axis=-1)
-
-        latent_scale_vector = tf.sqrt(tf.reduce_mean(var_vectors, axis=0, keepdims=True))
-        latent_scale_vector = tf.sqrt(tf.cast(hp.latent_vector_dim, dtype='float32')) * latent_scale_vector / tf.norm(latent_scale_vector, axis=-1, keepdims=True)
-        latent_vectors = hp.latent_dist_func([batch_size, hp.latent_vector_dim])
-
-        fake_condition_vectors = tf.matmul(latent_vectors * latent_scale_vector, svm_weights)
-        fake_condition_vectors = tf.where(fake_condition_vectors < 0, 0.0, 1.0)
+        fake_condition_vectors = tf.matmul(latent_vectors * latent_scale_vector[tf.newaxis], svm_weights)
+        fake_condition_vectors = tf.where(fake_condition_vectors < 0.0, 0.0, 1.0)
         fake_condition_vectors = tf.concat([fake_condition_vectors, 1 - fake_condition_vectors], axis=-1)
 
-        fake_images = generator(latent_vectors * latent_scale_vector, training=True)
-        fake_adv_vectors, rec_latent_vectors = discriminator(fake_images, training=True)
-        enc_losses = tf.reduce_mean(tf.square(rec_latent_vectors - latent_vectors) * tf.square(latent_scale_vector), axis=-1)
+        fake_adv_vectors, rec_latent_vectors = discriminator(fake_images)
+        enc_losses = tf.reduce_mean(tf.square((latent_vectors - rec_latent_vectors) * latent_scale_vector[tf.newaxis]), axis=-1)
 
-        with tf.GradientTape() as inner_tape:
-            inner_tape.watch(real_images)
-            real_adv_vectors, _ = discriminator(real_images, training=True)
-            real_adv_score = tf.reduce_mean(real_adv_vectors * real_condition_vectors, axis=-1) * 2
-        real_gradients = inner_tape.gradient(real_adv_score, real_images)
-        r1_regs = tf.reduce_sum(tf.square(real_gradients), axis=[1, 2, 3])
+        with tf.GradientTape() as reg_tape:
+            reg_tape.watch(real_images)
+            real_adv_vectors, _ = discriminator(real_images)
+            real_adv_scores = tf.reduce_mean(real_adv_vectors * real_condition_vectors, axis=-1) * 2
+        real_grads = reg_tape.gradient(real_adv_scores, real_images)
+        reg_losses = tf.reduce_sum(tf.square(real_grads), axis=[1, 2, 3])
 
-        discriminator_adv_losses = tf.reduce_mean(tf.nn.softplus(-real_adv_vectors) * real_condition_vectors
-                                                  + tf.nn.softplus(fake_adv_vectors) * fake_condition_vectors, axis=-1) * 2
-        discriminator_losses = discriminator_adv_losses + hp.enc_weight * enc_losses + hp.r1_weight * r1_regs
-        discriminator_loss = tf.reduce_mean(discriminator_losses)
-        generator_adv_losses = tf.reduce_mean(tf.nn.softplus(-fake_adv_vectors) * fake_condition_vectors, axis=-1) * 2
-        generator_losses = generator_adv_losses + hp.enc_weight * enc_losses
-        generator_loss = tf.reduce_mean(generator_losses)
+        dis_adv_losses = tf.reduce_mean(tf.nn.softplus(-real_adv_vectors) * real_condition_vectors +
+                                        tf.nn.softplus(fake_adv_vectors) * fake_condition_vectors, axis=-1) * 2
+        gen_adv_losses = tf.reduce_mean(tf.nn.softplus(-fake_adv_vectors) * fake_condition_vectors, axis=-1) * 2
+        dis_losses = dis_adv_losses + hp.enc_weight * enc_losses + hp.reg_weight * reg_losses
+        gen_losses = gen_adv_losses + hp.enc_weight * enc_losses
 
-    var_vectors = tf.concat([var_vectors[1:], tf.reduce_mean(tf.square(rec_latent_vectors), axis=0, keepdims=True)], axis=0)
-    hp.generator_optimizer.apply_gradients(
-        zip(tape.gradient(generator_loss, generator.trainable_variables),
-            generator.trainable_variables)
-    )
+        dis_loss = tf.reduce_mean(dis_losses)
+        gen_loss = tf.reduce_mean(gen_losses)
 
     hp.discriminator_optimizer.apply_gradients(
-        zip(tape.gradient(discriminator_loss, discriminator.trainable_variables),
+        zip(tape.gradient(dis_loss, discriminator.trainable_variables),
             discriminator.trainable_variables)
+    )
+    hp.generator_optimizer.apply_gradients(
+        zip(tape.gradient(gen_loss, generator.trainable_variables),
+            generator.trainable_variables)
     )
 
     del tape
 
-    return tf.reduce_mean(enc_losses), var_vectors
+    hp.discriminator_ema.apply(discriminator.trainable_variables)
+    hp.generator_ema.apply(generator.trainable_variables)
+    latent_var_trace.assign(latent_var_trace * hp.latent_var_decay_rate +
+                            tf.reduce_mean(tf.square(rec_latent_vectors), axis=0) * (1.0 - hp.latent_var_decay_rate))
+
+    fake_adv_scores = tf.reduce_mean(fake_adv_vectors * fake_condition_vectors, axis=-1) * 2
+    results = {
+        'real_adv_scores': real_adv_scores, 'fake_adv_scores': fake_adv_scores,
+        'reg_losses': reg_losses, 'enc_losses': enc_losses,
+    }
+    return results
 
 
-def train(generator: kr.Model, discriminator: kr.Model, dataset, var_vectors, svm_weights):
-    enc_losses = []
+def train(discriminator: kr.Model, generator: kr.Model, latent_var_trace: tf.Variable, svm_weights: tf.Tensor, dataset):
+    results = {}
     for data in dataset:
-        enc_loss, var_vectors = _train_step(generator, discriminator, data, var_vectors, svm_weights)
-        enc_losses.append(enc_loss)
-    mean_enc_loss = tf.reduce_mean(enc_losses)
+        batch_results = _gan_train_step(discriminator, generator, latent_var_trace, svm_weights, data)
+        for key in batch_results:
+            try:
+                results[key].append(batch_results[key])
+            except KeyError:
+                results[key] = [batch_results[key]]
 
-    return mean_enc_loss, var_vectors
+    temp_results = {}
+    for key in results:
+        mean, variance = tf.nn.moments(tf.concat(results[key], axis=0), axes=0)
+        temp_results[key + '_mean'] = mean
+        temp_results[key + '_variance'] = variance
+    results = temp_results
+
+    for key in results:
+        print('%-30s:' % key, '%13.6f' % results[key].numpy())
+
+    return results

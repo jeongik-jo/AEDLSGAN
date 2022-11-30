@@ -1,31 +1,30 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import tensorflow as tf
-import tensorflow.keras as kr
+from tensorflow import keras as kr
 
-generator_optimizer = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99) # optimizer for decoder of generator
-discriminator_optimizer = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99) # optimizer for discriminator (and encoder)
-lr_decay_rate = 0.9 # learning rate decay rate per epoch
-
+generator_optimizer = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99)
+generator_ema = tf.train.ExponentialMovingAverage(decay=0.999)
+discriminator_optimizer = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99)
+discriminator_ema = tf.train.ExponentialMovingAverage(decay=0.999)
 
 image_resolution = 256
-
-latent_vector_dim = 256
+latent_vector_dim = 512
 
 attributes = ['Bangs', 'Male', 'Smiling']
 attribute_size = len(attributes)
 
+reg_weight = 3.0
 enc_weight = 1.0
-r1_weight = 10.0
-var_vector_size = 512
-
-batch_size = 8
+latent_var_decay_rate = 0.999
+batch_size = 16
 save_image_size = 8
 save_trans_value = 0.1
 
 train_data_size = -1
 test_data_size = -1
-epochs = 25
+shuffle_test_dataset = False
+epochs = 30
 
 load_model = False
 
@@ -34,11 +33,8 @@ fid_batch_size = batch_size
 epoch_per_evaluate = 1
 
 
-def latent_dist_func(shape):
-    return tf.random.normal(shape)
+def latent_dist_func(batch_size):
+    return tf.random.normal([batch_size, latent_vector_dim])
 def latent_entropy_func(latent_scale_vector):
     return tf.reduce_sum(tf.math.log(latent_scale_vector * tf.sqrt(2.0 * 3.141592 * tf.exp(1.0))))
-def latent_add_noises(latent_vectors, noise_size):
-    noise = tf.random.normal([1, noise_size, latent_vector_dim], stddev=0.3)
-    noised_vectors_sets = latent_vectors[:, tf.newaxis, :] + noise
-    return noised_vectors_sets
+latent_interpolation_value = 2.0
