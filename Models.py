@@ -8,35 +8,32 @@ import numpy as np
 
 class Generator(object):
     def build_model(self):
-        latent_vector = kr.Input([hp.latent_vector_dim])
-        return kr.Model(latent_vector, Layers.Generator()(latent_vector))
+        ltn_vec = kr.Input([hp.ltn_dim])
+        return kr.Model(ltn_vec, Layers.Generator()(ltn_vec))
 
     def __init__(self):
         self.model = self.build_model()
-        self.latent_var_trace = tf.Variable(tf.ones([hp.latent_vector_dim]))
-        self.save_latent_vectors = [hp.latent_dist_func(hp.save_image_size) for _ in range(hp.save_image_size)]
-        self.svm_weights = tf.random.normal([hp.latent_vector_dim, hp.attribute_size])
+        self.save_ltn_vecs = [hp.ltn_dist_func(hp.batch_size) for _ in range(hp.batch_size)]
 
-    def save_images(self, discriminator: kr.Model, test_dataset: tf.data.Dataset, epoch):
-        latent_scale_vector = tf.sqrt(tf.cast(hp.latent_vector_dim, 'float32') * self.latent_var_trace / tf.reduce_sum(self.latent_var_trace))
+    def save_imgs(self, dis: kr.Model, dataset: tf.data.Dataset, epoch):
+        ltn_scl_vecs = hp.get_ltn_scl_vecs()
         if not os.path.exists('results/samples'):
             os.makedirs('results/samples')
         # --------------------------------------------------------------------------------------------------------------
-        def save_fake_images():
+        def save_fake_imgs():
             path = 'results/samples/fake_images'
             if not os.path.exists(path):
                 os.makedirs(path)
 
-            images = []
-            for i in range(hp.save_image_size):
-                fake_images = self.model(self.save_latent_vectors[i] * latent_scale_vector[tf.newaxis])
-                images.append(np.hstack(fake_images))
+            imgs = []
+            for i in range(hp.batch_size):
+                imgs.append(np.hstack(self.model(self.save_ltn_vecs[i] * ltn_scl_vecs)))
 
             kr.preprocessing.image.save_img(path=path + '/fake_%d.png' % epoch,
-                                            x=tf.clip_by_value(np.vstack(images), clip_value_min=-1, clip_value_max=1))
-        save_fake_images()
-        #--------------------------------------------------------------------------------------------------------------
-        def save_rec_images(is_real):
+                                            x=tf.clip_by_value(np.vstack(imgs), clip_value_min=-1, clip_value_max=1))
+        save_fake_imgs()
+        # --------------------------------------------------------------------------------------------------------------
+        def save_rec_imgs(is_real):
             if is_real:
                 path = 'results/samples/real_rec_images'
             else:
@@ -44,117 +41,119 @@ class Generator(object):
             if not os.path.exists(path):
                 os.makedirs(path)
 
-            images = []
-            for data in test_dataset.take(hp.save_image_size // 2):
+            imgs = []
+            for real_data in dataset.take(hp.batch_size // 2):
                 if is_real:
-                    input_images = data['image'][:hp.save_image_size]
+                    inp_imgs = real_data['img'][:hp.batch_size]
                 else:
-                    input_images = self.model(hp.latent_dist_func(hp.save_image_size) * latent_scale_vector[tf.newaxis])
-                _, rec_latent_vectors = discriminator(input_images)
-                rec_images = self.model(rec_latent_vectors * latent_scale_vector[tf.newaxis])
+                    inp_imgs = self.model(hp.ltn_dist_func(hp.batch_size) * ltn_scl_vecs)
+                rec_imgs = self.model(dis(inp_imgs)[1] * ltn_scl_vecs)
 
-                images.append(np.vstack(input_images))
-                images.append(np.vstack(rec_images))
-                images.append(tf.ones([np.vstack(input_images).shape[0], 5, 3]))
+                imgs.append(np.vstack(inp_imgs))
+                imgs.append(np.vstack(rec_imgs))
+                imgs.append(tf.ones([np.vstack(inp_imgs).shape[0], 5, hp.img_chn]))
 
-            images = tf.clip_by_value(np.hstack(images), clip_value_min=-1, clip_value_max=1)
+            imgs = tf.clip_by_value(np.hstack(imgs), clip_value_min=-1, clip_value_max=1)
             if is_real:
-                kr.preprocessing.image.save_img(path=path + '/real_rec_%d.png' % epoch, x=images)
+                kr.preprocessing.image.save_img(path=path + '/real_rec_%d.png' % epoch, x=imgs)
             else:
-                kr.preprocessing.image.save_img(path=path + '/fake_rec_%d.png' % epoch, x=images)
+                kr.preprocessing.image.save_img(path=path + '/fake_rec_%d.png' % epoch, x=imgs)
 
-        save_rec_images(True)
-        save_rec_images(False)
+        save_rec_imgs(True)
+        save_rec_imgs(False)
         # --------------------------------------------------------------------------------------------------------------
-        def save_interpolation_images():
+        def save_int_imgs():
             path = 'results/samples/latent_interpolation'
             if not os.path.exists(path):
                 os.makedirs(path)
 
-            indexes = tf.argsort(latent_scale_vector, axis=-1, direction='DESCENDING')
-            interpolation_values = tf.linspace(-hp.latent_interpolation_value, hp.latent_interpolation_value,
-                                               hp.save_image_size)[:, tf.newaxis]
-            latent_vectors = hp.latent_dist_func(hp.save_image_size)
-            for i in range(hp.save_image_size):
-                images = []
-                mask = tf.one_hot(indexes[i], axis=-1, depth=hp.latent_vector_dim)[tf.newaxis]
-                for j in range(hp.save_image_size):
-                    interpolation_latent_vectors = latent_vectors[j][tf.newaxis] * (
-                                1 - mask) + interpolation_values * mask
-                    images.append(np.hstack(
-                        self.model(interpolation_latent_vectors * latent_scale_vector[tf.newaxis])))
+            indexes = tf.argsort(ltn_scl_vecs[0], axis=-1, direction='DESCENDING')
+            int_vals = tf.linspace(-hp.ltn_int_val, hp.ltn_int_val, hp.batch_size)[:, tf.newaxis]
+            ltn_vecs = hp.ltn_dist_func(hp.batch_size)
+            for i in range(hp.batch_size):
+                imgs = []
+                mask = tf.one_hot(indexes[i], axis=-1, depth=hp.ltn_dim)[tf.newaxis]
+                for j in range(hp.batch_size):
+                    int_ltn_vecs = ltn_vecs[j][tf.newaxis] * (1 - mask) + int_vals * mask
+                    imgs.append(np.hstack(self.model(int_ltn_vecs * ltn_scl_vecs)))
 
                 kr.preprocessing.image.save_img(
                     path=path + '/latent_interpolation_%d_%d.png' % (epoch, i),
-                    x=tf.clip_by_value(np.vstack(images), clip_value_min=-1, clip_value_max=1))
+                    x=tf.clip_by_value(np.vstack(imgs), clip_value_min=-1, clip_value_max=1))
 
-        save_interpolation_images()
+        save_int_imgs()
         # --------------------------------------------------------------------------------------------------------------
-        def save_rec_trans_images(is_real):
+        def save_trs_imgs(is_real):
             if is_real:
-                path = 'results/samples/real_rec_trans_images'
+                path = 'results/samples/real_attribute_edit_images'
             else:
-                path = 'results/samples/fake_rec_trans_images'
+                path = 'results/samples/fake_attribute_edit_images'
             if not os.path.exists(path):
                 os.makedirs(path)
 
-            if is_real:
-                for data in test_dataset.take(1):
-                    input_images = data['image'][:hp.save_image_size]
-            else:
-                input_images = self.model(hp.latent_dist_func(hp.save_image_size) * latent_scale_vector[tf.newaxis])
-
-            for i in range(hp.attribute_size):
-                images = []
-                for j in range(hp.save_image_size):
-                    _, rec_latent_vector = discriminator(input_images[j][tf.newaxis])
-                    rec_image = tf.squeeze(self.model(rec_latent_vector * latent_scale_vector[tf.newaxis]))
-
-                    weight = self.svm_weights[tf.newaxis, :, i]
-                    condition_score = tf.reduce_mean(rec_latent_vector * latent_scale_vector * weight, keepdims=True)
-                    k = hp.latent_vector_dim * (condition_score - tf.linspace(-hp.save_trans_value, hp.save_trans_value, hp.save_image_size)[:, tf.newaxis]) / tf.reduce_sum(tf.square(weight), keepdims=True)
-                    trans_images = self.model(rec_latent_vector * latent_scale_vector - k * weight)
-                    images.append(np.hstack([
-                        input_images[j],
-                        rec_image,
-                        tf.ones([hp.image_resolution, 5, 3]),
-                        np.hstack(trans_images),
-                    ]))
-                images = tf.clip_by_value(np.vstack(images), clip_value_min=-1, clip_value_max=1)
+            for real_data in dataset.take(1):
                 if is_real:
-                    kr.preprocessing.image.save_img(path=path + '/real_trans_%d_%d.png' % (epoch, i), x=images)
+                    inp_imgs = real_data['img'][:hp.batch_size]
                 else:
-                    kr.preprocessing.image.save_img(path=path + '/fake_trans_%d_%d.png' % (epoch, i), x=images)
+                    inp_imgs = self.model(hp.ltn_dist_func(hp.batch_size) * ltn_scl_vecs)
 
-        save_rec_trans_images(True)
-        save_rec_trans_images(False)
+            for i in range(hp.ctg_dim):
+                imgs = []
+                for j in range(hp.batch_size):
+                    _, rec_ltn_vecs = dis(tf.tile(inp_imgs[j][tf.newaxis], [hp.batch_size, 1, 1, 1]))
+
+                    rec_image = self.model(rec_ltn_vecs * ltn_scl_vecs)[0]
+                    rec_ltn_vecs = rec_ltn_vecs[0][tf.newaxis]
+
+                    w = hp.cla_w[:, i]
+                    k = tf.reduce_sum(rec_ltn_vecs * ltn_scl_vecs * w)
+                    k = k - tf.cast(tf.linspace(-hp.trs_val, hp.trs_val, hp.batch_size), 'float32')[:, tf.newaxis] * tf.sqrt(tf.cast(hp.ltn_dim, 'float32'))
+                    k = k * w / tf.reduce_sum(tf.square(w))
+
+                    trs_imgs = self.model(rec_ltn_vecs * ltn_scl_vecs - k)
+
+                    imgs.append(np.hstack([
+                        inp_imgs[j],
+                        rec_image,
+                        tf.ones([hp.img_res, 5, 3]),
+                        np.hstack(trs_imgs),
+                    ]))
+
+                imgs = tf.clip_by_value(np.vstack(imgs), clip_value_min=-1, clip_value_max=1)
+                if is_real:
+                    kr.preprocessing.image.save_img(path=path + '/real_trans_%d_%d.png' % (epoch, i), x=imgs)
+                else:
+                    kr.preprocessing.image.save_img(path=path + '/fake_trans_%d_%d.png' % (epoch, i), x=imgs)
+
+        save_trs_imgs(True)
+        save_trs_imgs(False)
         # --------------------------------------------------------------------------------------------------------------
     def save(self):
         if not os.path.exists('models'):
             os.makedirs('models')
         self.model.save_weights('models/generator.h5')
-        np.save('models/latent_var_trace.npy', self.latent_var_trace)
-        np.save('models/svm_weights.npy', self.svm_weights)
+        np.save('models/latent_var_trace.npy', hp.ltn_var_trace)
+        np.save('models/cla_w.npy', hp.cla_w)
 
     def load(self):
         self.model.load_weights('models/generator.h5')
-        self.latent_var_trace.assign(np.load('models/latent_var_trace.npy'))
-        self.svm_weights = np.load('models/svm_weights.npy')
+        hp.ltn_var_trace.assign(np.load('models/latent_var_trace.npy'))
+        hp.cla_w.assign(np.load('models/cla_w.npy'))
 
     def to_ema(self):
-        self.train_weights = [tf.constant(weight) for weight in self.model.trainable_variables]
-        for weight in self.model.trainable_variables:
-            weight.assign(hp.generator_ema.average(weight))
+        self.train_w = [tf.constant(w) for w in self.model.trainable_variables]
+        hp.gen_opt.finalize_variable_values(self.model.trainable_variables)
+
 
     def to_train(self):
-        for ema_weight, train_weight in zip(self.model.trainable_variables, self.train_weights):
-            ema_weight.assign(train_weight)
+        for ema_w, train_w in zip(self.model.trainable_variables, self.train_w):
+            ema_w.assign(train_w)
 
 
 class Discriminator(object):
     def build_model(self):
-        input_image = kr.Input([hp.image_resolution, hp.image_resolution, 3])
-        return kr.Model(input_image, Layers.Discriminator()(input_image))
+        inp_img = kr.Input([hp.img_res, hp.img_res, hp.img_chn])
+        return kr.Model(inp_img, Layers.Discriminator()(inp_img))
 
     def __init__(self):
         self.model = self.build_model()
@@ -168,10 +167,9 @@ class Discriminator(object):
         self.model.load_weights('models/discriminator.h5')
 
     def to_ema(self):
-        self.train_weights = [tf.constant(weight) for weight in self.model.trainable_variables]
-        for weight in self.model.trainable_variables:
-            weight.assign(hp.discriminator_ema.average(weight))
+        self.train_w = [tf.constant(w) for w in self.model.trainable_variables]
+        hp.dis_opt.finalize_variable_values(self.model.trainable_variables)
 
     def to_train(self):
-        for ema_weight, train_weight in zip(self.model.trainable_variables, self.train_weights):
-            ema_weight.assign(train_weight)
+        for ema_w, train_w in zip(self.model.trainable_variables, self.train_w):
+            ema_w.assign(train_w)

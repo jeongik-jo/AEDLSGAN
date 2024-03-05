@@ -4,69 +4,70 @@ import HyperParameters as hp
 
 
 @tf.function
-def _gan_train_step(discriminator: kr.Model, generator: kr.Model, latent_var_trace: tf.Variable, svm_weights, data):
-    with tf.GradientTape(persistent=True) as tape:
-        real_images = data['image']
-        batch_size = real_images.shape[0]
-        latent_vector_dim = tf.cast(hp.latent_vector_dim, 'float32')
-        latent_scale_vector = tf.sqrt(latent_vector_dim * latent_var_trace / tf.reduce_sum(latent_var_trace))
-        latent_vectors = hp.latent_dist_func(batch_size)
+def _train_step(dis: kr.Model, gen: kr.Model, real_data):
+    ltn_scl_vecs = hp.get_ltn_scl_vecs()
+    real_imgs = real_data['img']
+    real_ctg_vecs = real_data['ctg_vec']
+    real_ctg_vecs = tf.concat([real_ctg_vecs, 1 - real_ctg_vecs], axis=-1)
+    batch_size = real_imgs.shape[0]
 
-        fake_images = generator(latent_vectors * latent_scale_vector[tf.newaxis])
+    ltn_vecs = hp.ltn_dist_func(batch_size)
+    ctg_vecs = (ltn_vecs * ltn_scl_vecs) @ hp.cla_w
+    ctg_vecs = tf.where(ctg_vecs > 0.0, 1.0, 0.0)
+    ctg_vecs = tf.concat([ctg_vecs, 1 - ctg_vecs], axis=-1)
 
-        real_condition_vectors = data['attributes']
-        real_condition_vectors = tf.concat([real_condition_vectors, 1 - real_condition_vectors], axis=-1)
-        fake_condition_vectors = tf.matmul(latent_vectors * latent_scale_vector[tf.newaxis], svm_weights)
-        fake_condition_vectors = tf.where(fake_condition_vectors < 0.0, 0.0, 1.0)
-        fake_condition_vectors = tf.concat([fake_condition_vectors, 1 - fake_condition_vectors], axis=-1)
+    fake_imgs = gen(ltn_vecs * ltn_scl_vecs)
 
-        fake_adv_vectors, rec_latent_vectors = discriminator(fake_images)
-        enc_losses = tf.reduce_mean(tf.square((latent_vectors - rec_latent_vectors) * latent_scale_vector[tf.newaxis]), axis=-1)
-
+    with tf.GradientTape() as dis_tape:
         with tf.GradientTape() as reg_tape:
-            reg_tape.watch(real_images)
-            real_adv_vectors, _ = discriminator(real_images)
-            real_adv_scores = tf.reduce_mean(real_adv_vectors * real_condition_vectors, axis=-1) * 2
-        real_grads = reg_tape.gradient(real_adv_scores, real_images)
-        reg_losses = tf.reduce_sum(tf.square(real_grads), axis=[1, 2, 3])
+            reg_tape.watch(real_imgs)
+            real_adv_vecs, _ = dis(real_imgs)
+            real_scores = tf.reduce_sum(real_adv_vecs * real_ctg_vecs, axis=-1) / hp.ctg_dim
+        reg_loss = tf.reduce_mean(tf.reduce_sum(tf.square(reg_tape.gradient(real_scores, real_imgs)), axis=[1, 2, 3]))
+        fake_adv_vecs, rec_ltn_vecs = dis(fake_imgs)
 
-        dis_adv_losses = tf.reduce_mean(tf.nn.softplus(-real_adv_vectors) * real_condition_vectors +
-                                        tf.nn.softplus(fake_adv_vectors) * fake_condition_vectors, axis=-1) * 2
-        gen_adv_losses = tf.reduce_mean(tf.nn.softplus(-fake_adv_vectors) * fake_condition_vectors, axis=-1) * 2
-        dis_losses = dis_adv_losses + hp.enc_weight * enc_losses + hp.reg_weight * reg_losses
-        gen_losses = gen_adv_losses + hp.enc_weight * enc_losses
+        enc_loss = tf.reduce_mean(tf.square((ltn_vecs - rec_ltn_vecs) * ltn_scl_vecs))
 
-        dis_loss = tf.reduce_mean(dis_losses)
-        gen_loss = tf.reduce_mean(gen_losses)
+        dis_adv_losses = tf.reduce_sum(tf.nn.softplus(-real_adv_vecs) * real_ctg_vecs + tf.nn.softplus(fake_adv_vecs) * ctg_vecs, axis=-1) / hp.ctg_dim
+        dis_adv_loss = tf.reduce_mean(dis_adv_losses)
+        dis_loss = dis_adv_loss + hp.enc_w * enc_loss + hp.reg_w * reg_loss
 
-    hp.discriminator_optimizer.apply_gradients(
-        zip(tape.gradient(dis_loss, discriminator.trainable_variables),
-            discriminator.trainable_variables)
-    )
-    hp.generator_optimizer.apply_gradients(
-        zip(tape.gradient(gen_loss, generator.trainable_variables),
-            generator.trainable_variables)
-    )
+    hp.dis_opt.minimize(dis_loss, dis.trainable_variables, tape=dis_tape)
+    rec_ltn_traces = rec_ltn_vecs
 
-    del tape
+    ltn_vecs = hp.ltn_dist_func(batch_size)
+    ctg_vecs = (ltn_vecs * ltn_scl_vecs) @ hp.cla_w
+    ctg_vecs = tf.where(ctg_vecs > 0.0, 1.0, 0.0)
+    ctg_vecs = tf.concat([ctg_vecs, 1 - ctg_vecs], axis=-1)
 
-    hp.discriminator_ema.apply(discriminator.trainable_variables)
-    hp.generator_ema.apply(generator.trainable_variables)
-    latent_var_trace.assign(latent_var_trace * hp.latent_var_decay_rate +
-                            tf.reduce_mean(tf.square(rec_latent_vectors), axis=0) * (1.0 - hp.latent_var_decay_rate))
+    with tf.GradientTape() as gen_tape:
+        fake_imgs = gen(ltn_vecs * ltn_scl_vecs)
+        fake_adv_vecs, rec_ltn_vecs = dis(fake_imgs)
 
-    fake_adv_scores = tf.reduce_mean(fake_adv_vectors * fake_condition_vectors, axis=-1) * 2
+        enc_loss = tf.reduce_mean(tf.square((ltn_vecs - rec_ltn_vecs) * ltn_scl_vecs))
+
+        gen_adv_losses = tf.reduce_sum(tf.nn.softplus(-fake_adv_vecs) * ctg_vecs, axis=-1) / hp.ctg_dim
+        gen_adv_loss = tf.reduce_mean(gen_adv_losses)
+        gen_loss = gen_adv_loss + hp.enc_w * enc_loss
+
+    hp.gen_opt.minimize(gen_loss, gen.trainable_variables, tape=gen_tape)
+    rec_ltn_traces = tf.concat([rec_ltn_traces, rec_ltn_vecs], axis=0)
+
+    hp.ltn_var_trace.assign(hp.ltn_var_trace * hp.ltn_var_decay_rate +
+                            tf.reduce_mean(tf.square(rec_ltn_traces), axis=0) * (1.0 - hp.ltn_var_decay_rate))
+
+    fake_scores = tf.reduce_sum(fake_adv_vecs * ctg_vecs, axis=-1) / hp.ctg_dim
     results = {
-        'real_adv_scores': real_adv_scores, 'fake_adv_scores': fake_adv_scores,
-        'reg_losses': reg_losses, 'enc_losses': enc_losses,
+        'real_adv_val': tf.reduce_mean(real_scores), 'fake_adv_val': tf.reduce_mean(fake_scores),
+        'reg_loss': reg_loss, 'enc_loss': enc_loss
     }
     return results
 
 
-def train(discriminator: kr.Model, generator: kr.Model, latent_var_trace: tf.Variable, svm_weights: tf.Tensor, dataset):
+def train(dis: kr.Model, gen: kr.Model, dataset):
     results = {}
     for data in dataset:
-        batch_results = _gan_train_step(discriminator, generator, latent_var_trace, svm_weights, data)
+        batch_results = _train_step(dis, gen, data)
         for key in batch_results:
             try:
                 results[key].append(batch_results[key])
@@ -75,12 +76,14 @@ def train(discriminator: kr.Model, generator: kr.Model, latent_var_trace: tf.Var
 
     temp_results = {}
     for key in results:
-        mean, variance = tf.nn.moments(tf.concat(results[key], axis=0), axes=0)
+        mean, variance = tf.nn.moments(tf.convert_to_tensor(results[key]), axes=0)
         temp_results[key + '_mean'] = mean
         temp_results[key + '_variance'] = variance
+    temp_results['ltn_ent'] = hp.get_ltn_ent()
     results = temp_results
 
     for key in results:
         print('%-30s:' % key, '%13.6f' % results[key].numpy())
 
     return results
+
