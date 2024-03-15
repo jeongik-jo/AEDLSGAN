@@ -3,9 +3,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import tensorflow as tf
 from tensorflow import keras as kr
 
-dis_opt = kr.optimizers.AdamW(learning_rate=0.003, weight_decay=0.0001, beta_1=0.0, beta_2=0.99,
+dis_opt = kr.optimizers.AdamW(learning_rate=0.001, weight_decay=0.0001, beta_1=0.0, beta_2=0.99,
                               use_ema=True, ema_momentum=0.999, ema_overwrite_frequency=None)
-gen_opt = kr.optimizers.AdamW(learning_rate=0.003, weight_decay=0.0001, beta_1=0.0, beta_2=0.99,
+gen_opt = kr.optimizers.AdamW(learning_rate=0.001, weight_decay=0.0001, beta_1=0.0, beta_2=0.99,
                               use_ema=True, ema_momentum=0.999, ema_overwrite_frequency=None)
 
 atts = ['Bangs', 'Male', 'Smiling']
@@ -27,7 +27,7 @@ batch_size = 8
 
 train_data_size = -1
 test_data_size = -1
-epochs = 30
+epochs = 100
 
 load_model = False
 
